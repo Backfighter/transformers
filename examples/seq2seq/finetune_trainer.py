@@ -120,6 +120,35 @@ class DataTrainingArguments:
 
 
 def main():
+    model_args, data_args, training_args = parse_args()
+
+    setup_logging(training_args)
+
+    # Set seed
+    set_seed(training_args.seed)
+
+    config, tokenizer, model = load_model(
+        model_args, training_args, data_args
+    )
+
+    train_dataset, eval_dataset, test_dataset = load_datasets(
+        tokenizer, model, data_args, training_args
+    )
+
+    trainer = init_trainer(
+        config, tokenizer, model, 
+        train_dataset, eval_dataset, 
+        training_args, data_args
+    )
+
+    train(trainer, tokenizer, training_args, model_args)
+
+    return evaluate(
+        trainer, tokenizer, test_dataset, training_args
+    )
+
+
+def parse_args():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
@@ -135,30 +164,78 @@ def main():
 
     check_output_dir(training_args)
 
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO if training_args.local_rank in [-1, 0] else logging.WARN,
-    )
-    logger.warning(
-        "Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
-        training_args.local_rank,
-        training_args.device,
-        training_args.n_gpu,
-        bool(training_args.parallel_mode == ParallelMode.DISTRIBUTED),
-        training_args.fp16,
-    )
-    # Set the verbosity to info of the Transformers logger (on main process only):
-    if is_main_process(training_args.local_rank):
-        transformers.utils.logging.set_verbosity_info()
-        transformers.utils.logging.enable_default_handler()
-        transformers.utils.logging.enable_explicit_format()
-    logger.info("Training/evaluation parameters %s", training_args)
+    return model_args, data_args, training_args
 
-    # Set seed
-    set_seed(training_args.seed)
 
+def init_trainer(
+    config, tokenizer, model, 
+    train_dataset, eval_dataset, 
+    training_args, data_args
+):
+    # Initialize our Trainer
+    compute_metrics_fn = (
+        build_compute_metrics_fn(data_args.task, tokenizer) if training_args.predict_with_generate else None
+    )
+    trainer = Seq2SeqTrainer(
+        model=model,
+        config=config,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=Seq2SeqDataCollator(tokenizer, data_args, training_args.tpu_num_cores),
+        compute_metrics=compute_metrics_fn,
+        data_args=data_args,
+    )
+    return trainer
+
+
+def load_datasets(tokenizer, model, data_args, training_args):
+    dataset_class = Seq2SeqDataset
+
+    # Get datasets
+    train_dataset = (
+        dataset_class(
+            tokenizer,
+            type_path="train",
+            data_dir=data_args.data_dir,
+            n_obs=data_args.n_train,
+            max_target_length=data_args.max_target_length,
+            max_source_length=data_args.max_source_length,
+            prefix=model.config.prefix or "",
+        )
+        if training_args.do_train
+        else None
+    )
+    eval_dataset = (
+        dataset_class(
+            tokenizer,
+            type_path="val",
+            data_dir=data_args.data_dir,
+            n_obs=data_args.n_val,
+            max_target_length=data_args.val_max_target_length,
+            max_source_length=data_args.max_source_length,
+            prefix=model.config.prefix or "",
+        )
+        if training_args.do_eval or training_args.evaluation_strategy != EvaluationStrategy.NO
+        else None
+    )
+    test_dataset = (
+        dataset_class(
+            tokenizer,
+            type_path="test",
+            data_dir=data_args.data_dir,
+            n_obs=data_args.n_test,
+            max_target_length=data_args.test_max_target_length,
+            max_source_length=data_args.max_source_length,
+            prefix=model.config.prefix or "",
+        )
+        if training_args.do_predict
+        else None
+    )
+    return train_dataset, eval_dataset, test_dataset
+
+
+def load_model(model_args, training_args, data_args):
     # Load pretrained model and tokenizer
     #
     # Distributed training:
@@ -207,64 +284,33 @@ def main():
         freeze_params(model.get_encoder())
         assert_all_frozen(model.get_encoder())
 
-    dataset_class = Seq2SeqDataset
+    return config, tokenizer, model
 
-    # Get datasets
-    train_dataset = (
-        dataset_class(
-            tokenizer,
-            type_path="train",
-            data_dir=data_args.data_dir,
-            n_obs=data_args.n_train,
-            max_target_length=data_args.max_target_length,
-            max_source_length=data_args.max_source_length,
-            prefix=model.config.prefix or "",
-        )
-        if training_args.do_train
-        else None
-    )
-    eval_dataset = (
-        dataset_class(
-            tokenizer,
-            type_path="val",
-            data_dir=data_args.data_dir,
-            n_obs=data_args.n_val,
-            max_target_length=data_args.val_max_target_length,
-            max_source_length=data_args.max_source_length,
-            prefix=model.config.prefix or "",
-        )
-        if training_args.do_eval or training_args.evaluation_strategy != EvaluationStrategy.NO
-        else None
-    )
-    test_dataset = (
-        dataset_class(
-            tokenizer,
-            type_path="test",
-            data_dir=data_args.data_dir,
-            n_obs=data_args.n_test,
-            max_target_length=data_args.test_max_target_length,
-            max_source_length=data_args.max_source_length,
-            prefix=model.config.prefix or "",
-        )
-        if training_args.do_predict
-        else None
-    )
 
-    # Initialize our Trainer
-    compute_metrics_fn = (
-        build_compute_metrics_fn(data_args.task, tokenizer) if training_args.predict_with_generate else None
+def setup_logging(training_args):
+    # Setup logging
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO if training_args.local_rank in [-1, 0] else logging.WARN,
     )
-    trainer = Seq2SeqTrainer(
-        model=model,
-        config=config,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=Seq2SeqDataCollator(tokenizer, data_args, training_args.tpu_num_cores),
-        compute_metrics=compute_metrics_fn,
-        data_args=data_args,
+    logger.warning(
+        "Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
+        training_args.local_rank,
+        training_args.device,
+        training_args.n_gpu,
+        bool(training_args.parallel_mode == ParallelMode.DISTRIBUTED),
+        training_args.fp16,
     )
+    # Set the verbosity to info of the Transformers logger (on main process only):
+    if is_main_process(training_args.local_rank):
+        transformers.utils.logging.set_verbosity_info()
+        transformers.utils.logging.enable_default_handler()
+        transformers.utils.logging.enable_explicit_format()
+    logger.info("Training/evaluation parameters %s", training_args)
 
+
+def train(trainer, tokenizer, training_args, model_args):
     # Training
     if training_args.do_train:
         trainer.train(
@@ -277,6 +323,8 @@ def main():
             trainer.state.save_to_json(os.path.join(training_args.output_dir, "trainer_state.json"))
             tokenizer.save_pretrained(training_args.output_dir)
 
+
+def evaluate(trainer, tokenizer, test_dataset, training_args):
     # Evaluation
     eval_results = {}
     if training_args.do_eval:
@@ -290,7 +338,7 @@ def main():
                 logger.info("  %s = %s", key, value)
             save_json(result, os.path.join(training_args.output_dir, "eval_results.json"))
             eval_results.update(result)
-
+    # Testing
     if training_args.do_predict:
         logging.info("*** Test ***")
 
@@ -317,9 +365,35 @@ def main():
     return eval_results
 
 
-def _mp_fn(index):
+def provide_mp_fn():
     # For xla_spawn (TPUs)
-    main()
+    model_args, data_args, training_args = parse_args()
+    # Set seed
+    set_seed(training_args.seed)
+    config, tokenizer, model = load_model(
+        model_args, training_args, data_args
+    )
+
+    train_dataset, eval_dataset, test_dataset = load_datasets(
+        tokenizer, model, data_args, training_args
+    )
+
+    def _mp_fn(index):
+        setup_logging(training_args)
+
+        trainer = init_trainer(
+            config, tokenizer, model, 
+            train_dataset, eval_dataset, 
+            training_args, data_args
+        )
+        
+        train(trainer, tokenizer, training_args, model_args)
+
+        return evaluate(
+            trainer, tokenizer, test_dataset, training_args
+        )
+
+    return _mp_fn
 
 
 if __name__ == "__main__":
